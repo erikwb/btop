@@ -18,3 +18,8 @@ target_link_libraries(btop_test libbtop_test)
 
 include(GoogleTest)
 gtest_discover_tests(btop_test)
+
+if(LINUX)
+  add_executable(asahi_memory_test asahi_memory.cpp)
+  add_test(NAME asahi_memory COMMAND asahi_memory_test)
+endif()

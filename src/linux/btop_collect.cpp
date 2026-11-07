@@ -55,6 +55,7 @@ tab-size = 4
 #include "../btop_log.hpp"
 #include "../btop_shared.hpp"
 #include "../btop_tools.hpp"
+#include "asahi_memory.hpp"
 
 #if defined(GPU_SUPPORT)
 	// Redefining C++ keywords fortunately has a warning in clang, however it's unavoidable here
@@ -295,6 +296,12 @@ namespace Gpu {
 		uint32_t device_count = 0;
 	}
 
+	//? Apple/Asahi shared-memory accounting (no vendor library required).
+	namespace AppleSysfs {
+		bool init();
+		void collect();
+	}
+
 	//? AMD sysfs (consumer GPU / iGPU) data collection — fallback when amd-smi/rocm-smi
 	//? cannot enumerate (e.g. APUs without /dev/kfd, or systems without ROCm libs installed).
 	//? Reads only standard amdgpu DRM sysfs nodes; no library dependency.
@@ -404,12 +411,21 @@ namespace Shared {
 		if (shown_gpus.contains("intel")) {
 			Gpu::Intel::init();
 		}
+		if (shown_gpus.contains("apple")) Gpu::AppleSysfs::init();
 
 		if (not Gpu::gpu_names.empty()) {
-			for (auto const& [key, _] : Gpu::gpus[0].gpu_percent)
-				Cpu::available_fields.push_back(key);
-			for (auto const& [key, _] : Gpu::shared_gpu_percent)
-				Cpu::available_fields.push_back(key);
+			for (const auto& gpu : Gpu::gpus) {
+				for (const auto& [key, values] : gpu.gpu_percent)
+					if (not values.empty() and (key != "gpu-totals" or gpu.gpu_utilization_valid)
+						and not v_contains(Cpu::available_fields, key))
+						Cpu::available_fields.push_back(key);
+			}
+			if (v_contains(Cpu::available_fields, "gpu-totals"s))
+				Cpu::available_fields.push_back("gpu-average");
+			if (v_contains(Cpu::available_fields, "gpu-vram-totals"s))
+				Cpu::available_fields.push_back("gpu-vram-total");
+			if (v_contains(Cpu::available_fields, "gpu-pwr-totals"s))
+				Cpu::available_fields.push_back("gpu-pwr-total");
 
 			using namespace Gpu;
 			count = gpus.size();
@@ -2211,6 +2227,88 @@ namespace Gpu {
 		template bool collect<1>(gpu_info*);
 	}
 
+	//? Only export metrics the kernel actually supplies. G17 agx_stats may say
+	//? "unsupported"; neither device presence nor memory use implies GPU load.
+	namespace AppleSysfs {
+		struct device_info {
+			fs::path memory;
+			fs::path activity;
+			size_t index;
+		};
+		vector<device_info> devices;
+
+		static void update(gpu_info& gpu, const AsahiMemory::Sample& sample) {
+			gpu.mem_used = sample.allocated;
+			gpu.mem_total = sample.limit;
+			if (sample.limit > 0)
+				gpu.gpu_percent.at("gpu-vram-totals").push_back(clamp(
+					static_cast<long long>(round(100.0 * sample.allocated / sample.limit)), 0LL, 100LL));
+		}
+
+		bool init() {
+			if (not devices.empty()) return false;
+			std::error_code ec;
+			fs::directory_iterator it("/sys/class/drm", ec), end;
+			for (; not ec and it != end; it.increment(ec)) {
+				const auto name = it->path().filename().string();
+				if (not name.starts_with("card") or name.size() == 4
+					or name.find_first_not_of("0123456789", 4) != string::npos) continue;
+				const auto device = it->path() / "device";
+				std::error_code driver_error;
+				const auto driver = fs::read_symlink(device / "driver", driver_error).filename();
+				if (driver_error or (driver != "asahi" and driver != "apple-gpu" and driver != "aurora")) continue;
+				const auto memory = device / "gpu_memory";
+				ifstream input(memory);
+				const auto sample = AsahiMemory::parse(input);
+				if (not sample) continue;
+
+				ifstream activity_input(device / "agx_stats");
+				const auto activity = AsahiMemory::parse_activity(activity_input);
+				const auto index = gpus.size();
+				gpus.emplace_back();
+				gpu_names.resize(gpus.size());
+				const auto model = readfile("/proc/device-tree/model", "");
+				gpu_names[index] = model.contains("M5 Max") ? "Apple M5 Max" : "Apple AGX";
+				auto& gpu = gpus.back();
+				gpu.supported_functions = {
+					.gpu_utilization = activity.qualified, .mem_utilization = false,
+					.gpu_clock = false, .mem_clock = false,
+					.pwr_usage = false, .pwr_state = false, .temp_info = false,
+					.mem_total = sample->limit > 0, .mem_used = true,
+					.pcie_txrx = false, .encoder_utilization = false, .decoder_utilization = false,
+				};
+				gpu.gpu_utilization_valid = activity.percent.has_value();
+				gpu.gpu_percent.at("gpu-totals").push_back(activity.percent.value_or(0));
+				gpu.mem_is_shared = true;
+				gpu.mem_total_is_limit = true;
+				update(gpu, *sample);
+				devices.push_back({memory, device / "agx_stats", index});
+				Logger::info("Apple GPU shared-memory accounting: {}; qualified activity: {}", memory.string(), activity.qualified);
+			}
+			return not devices.empty();
+		}
+
+		void collect() {
+			for (const auto& device : devices) {
+				ifstream input(device.memory);
+				auto& gpu = gpus[device.index];
+				if (const auto sample = AsahiMemory::parse(input)) update(gpu, *sample);
+				ifstream activity_input(device.activity);
+				const auto activity = AsahiMemory::parse_activity(activity_input);
+				const bool valid = activity.percent.has_value();
+				if (valid != gpu.gpu_utilization_valid) {
+					// Clear old graphs on both stale->valid and valid->stale transitions.
+					gpu.gpu_percent.at("gpu-totals").clear();
+					gpu.gpu_percent.at("gpu-totals").push_back(0);
+					for (size_t i = 0; i < Gpu::redraw.size(); ++i) Gpu::redraw[i] = true;
+					Cpu::redraw = true;
+				}
+				gpu.gpu_utilization_valid = valid;
+				if (valid) gpu.gpu_percent.at("gpu-totals").push_back(*activity.percent);
+			}
+		}
+	}
+
 	//? Collect data from GPU-specific libraries
 	auto collect(bool no_update) -> vector<gpu_info>& {
 		if (Runner::stopping or (no_update and not gpus.empty())) return gpus;
@@ -2222,15 +2320,19 @@ namespace Gpu {
 		Rsmi::collect<0>(gpus.data() + Nvml::device_count); // size = Rsmi::device_count
 		Asysfs::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count); // size = Asysfs::device_count
 		Intel::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count); // size = Intel::device_count
+		AppleSysfs::collect();
 
 		//* Calculate average usage
 		long long avg = 0;
+		size_t utilization_count = 0;
 		long long mem_usage_total = 0;
 		long long mem_total = 0;
 		long long pwr_total = 0;
 		for (auto& gpu : gpus) {
-			if (gpu.supported_functions.gpu_utilization)
+			if (gpu.supported_functions.gpu_utilization and gpu.gpu_utilization_valid) {
 				avg += gpu.gpu_percent.at("gpu-totals").back();
+				++utilization_count;
+			}
 			if (gpu.supported_functions.mem_used)
 				mem_usage_total += gpu.mem_used;
 			if (gpu.supported_functions.mem_total)
@@ -2252,7 +2354,7 @@ namespace Gpu {
 			}
 		}
 
-		shared_gpu_percent.at("gpu-average").push_back(avg / gpus.size());
+		if (utilization_count > 0) shared_gpu_percent.at("gpu-average").push_back(avg / utilization_count);
 		if (mem_total != 0)
 			shared_gpu_percent.at("gpu-vram-total").push_back(static_cast<long long>(round(mem_usage_total * 100.0 / mem_total)));
 		if (gpu_pwr_total_max != 0)

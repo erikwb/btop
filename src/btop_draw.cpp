@@ -591,7 +591,7 @@ namespace Cpu {
 		auto graph_lo_field = Config::getS("cpu_graph_lower");
 		if (graph_lo_field == "Auto" or not v_contains(Cpu::available_fields, graph_lo_field)) {
 		#ifdef GPU_SUPPORT
-			graph_lo_field = show_gpu ? "gpu-totals" : graph_up_field;
+			graph_lo_field = show_gpu and v_contains(Cpu::available_fields, "gpu-totals"s) ? "gpu-totals" : graph_up_field;
 		#else
 			graph_lo_field = graph_up_field;
 		#endif
@@ -663,8 +663,8 @@ namespace Cpu {
 								continue;
 							auto& gpu = gpus[i]; auto& graph = graphs[i];
 
-							//? GPU graphs
-							if (gpu.supported_functions.gpu_utilization) {
+							//? Each metric can be available independently of engine utilization.
+							if (not safeVal(gpu.gpu_percent, graph_field).empty()) {
 								if (i + 1 < gpus.size()) {
 									graph = Draw::Graph{graph_width, graph_height, "cpu", safeVal(gpu.gpu_percent, graph_field), graph_symbol, invert, true};
 								}
@@ -723,7 +723,7 @@ namespace Cpu {
 					width_left -= (gpu.supported_functions.mem_used ? 5 : 0);
 					width_left -= (gpu.supported_functions.mem_total ? 6 : 0);
 					width_left -= (gpu.supported_functions.pwr_usage ? 6 : 0);
-					if (gpu.supported_functions.gpu_utilization) {
+					if (gpu.supported_functions.gpu_utilization and gpu.gpu_utilization_valid) {
 						gpu_meters[i] = Draw::Meter{width_left, "cpu" };
 					}
 				}
@@ -817,7 +817,9 @@ namespace Cpu {
 							if (gpu_auto and v_contains(Gpu::shown_panels, i)) {
 								continue;
 							}
-							try {
+							if (graph_field == "gpu-totals" and not gpus[i].gpu_utilization_valid) {
+								out += Theme::c("inactive_fg") + ljust("N/A", graph_width);
+							} else try {
 								const auto& gpu_percent = gpus[i].gpu_percent;
 								out += graphs[i](safeVal(gpu_percent, graph_field), (data_same or redraw));
 							} catch (std::out_of_range& /* unused */) {
@@ -833,6 +835,10 @@ namespace Cpu {
 								out += Theme::c("div_line") + (Symbols::v_line + Mv::l(1) + Mv::u(1))*graph_height + Mv::r(1) + Mv::d(1);
 						}
 					}
+					else if (graph_field == "gpu-average" and not rng::any_of(gpus, [](const auto& gpu) {
+						return gpu.supported_functions.gpu_utilization and gpu.gpu_utilization_valid;
+					}))
+						out += Theme::c("inactive_fg") + "N/A";
 					else
 						out += graphs[0](safeVal(Gpu::shared_gpu_percent, graph_field), (data_same or redraw));
 				else
@@ -980,7 +986,7 @@ namespace Cpu {
 					continue;
 				out += Mv::to(b_y + ++cy, b_x + 1) + Theme::c("main_fg") + Fx::b + "GPU";
 				if (gpus.size() > 1) out += rjust(to_string(i), 1 + (gpus.size() > 9));
-				if (gpus[i].supported_functions.gpu_utilization) {
+				if (gpus[i].supported_functions.gpu_utilization and gpus[i].gpu_utilization_valid) {
 					out += ' ';
 					if (b_columns > 1) {
 					out += gpu_meters[i](safeVal(gpus[i].gpu_percent, "gpu-totals"s).back())
@@ -1082,7 +1088,7 @@ namespace Gpu {
 			graph_up_height = single_graph ? b_height_vec[index] : (b_height_vec[index] + 1) / 2;
 			int graph_low_height = single_graph ? 0 : b_height_vec[index] - graph_up_height;
 
-			if (gpu.supported_functions.gpu_utilization) {
+			if (gpu.supported_functions.gpu_utilization and gpu.gpu_utilization_valid) {
 				graph_upper = Draw::Graph{x + width - b_width - 3, graph_up_height, "cpu", safeVal(gpu.gpu_percent, "gpu-totals"s), graph_symbol, false, true}; // TODO cpu -> gpu
             	if (not single_graph) {
                 	graph_lower = Draw::Graph{
@@ -1111,7 +1117,7 @@ namespace Gpu {
 		//* General GPU info
 		int rows_used = 1;
 		//? Gpu graph, meter & clock speed
-		if (gpu.supported_functions.gpu_utilization) {
+		if (gpu.supported_functions.gpu_utilization and gpu.gpu_utilization_valid) {
 			out += Fx::ub + Mv::to(y + rows_used, x + 1) + graph_upper(safeVal(gpu.gpu_percent, "gpu-totals"s), (data_same or redraw[index]));
 			if (not single_graph)
 				out += Mv::to(y + rows_used + graph_up_height, x + 1) + graph_lower(safeVal(gpu.gpu_percent, "gpu-totals"s), (data_same or redraw[index]));
@@ -1130,10 +1136,23 @@ namespace Gpu {
 			rows_used++;
 		}
 
+		if (gpu.supported_functions.gpu_utilization and not gpu.gpu_utilization_valid) {
+			out += Mv::to(b_y + rows_used, b_x + 1) + Theme::c("inactive_fg") + "GPU N/A";
+			rows_used++;
+		}
+
 		if (gpu.supported_functions.gpu_clock) {
 			string clock_speed_string = to_string(gpu.gpu_clock_speed);
 			out += Mv::to(b_y, b_x + b_width - 12) + Theme::c("div_line") + Symbols::h_line*(5-clock_speed_string.size())
 				+ Symbols::title_left + Fx::b + Theme::c("title") + clock_speed_string + " MHz" + Fx::ub + Theme::c("div_line") + Symbols::title_right;
+		}
+
+		if (not gpu.supported_functions.gpu_utilization or not gpu.gpu_utilization_valid) {
+			const int text_width = max(0, b_x - x - 3);
+			out += Mv::to(y + 2, x + 2) + Theme::c("inactive_fg")
+				+ string("GPU load unavailable").substr(0, text_width);
+			if (gpu.mem_is_shared)
+				out += Mv::to(y + 3, x + 2) + string("Shared memory allocations").substr(0, text_width);
 		}
 
 		//? Power usage meter, power state
@@ -1165,12 +1184,12 @@ namespace Gpu {
 					* (1 + 2*(gpu.supported_functions.mem_total and gpu.supported_functions.mem_used) + 2*gpu.supported_functions.mem_utilization);
 
 				//? Used graph, memory section header, total vram
-				out += Theme::c("div_line") + Symbols::div_left + Symbols::h_line + Symbols::title_left + Fx::b + Theme::c("title") + "vram" + Theme::c("div_line") + Fx::ub + Symbols::title_right
-					+  Symbols::h_line*(b_width/2-8) + Symbols::div_up + Mv::d(offset)+Mv::l(1) + Symbols::div_down + Mv::l(1)+Mv::u(1) + (Symbols::v_line + Mv::l(1)+Mv::u(1))*(offset-1) + Symbols::div_up
+				out += Theme::c("div_line") + Symbols::div_left + Symbols::h_line + Symbols::title_left + Fx::b + Theme::c("title") + (gpu.mem_is_shared ? "shmem" : "vram") + Theme::c("div_line") + Fx::ub + Symbols::title_right
+					+  Symbols::h_line*(b_width/2-8-gpu.mem_is_shared) + Symbols::div_up + Mv::d(offset)+Mv::l(1) + Symbols::div_down + Mv::l(1)+Mv::u(1) + (Symbols::v_line + Mv::l(1)+Mv::u(1))*(offset-1) + Symbols::div_up
 					+  Symbols::h_line + Theme::c("title") + "Used:" + Theme::c("div_line")
 					+  Symbols::h_line*(b_width/2+b_width%2-9-used_memory_string.size()) + Theme::c("title") + used_memory_string + Theme::c("div_line") + Symbols::h_line + Symbols::div_right
 					+  Mv::d(1) + Mv::l(b_width/2-1) + mem_used_graph(safeVal(gpu.gpu_percent, "gpu-vram-totals"s), (data_same or redraw[index]))
-					+  Mv::l(b_width-3) + Mv::u(1+2*gpu.supported_functions.mem_utilization) + Theme::c("main_fg") + Fx::b + "Total:" + rjust(floating_humanizer(gpu.mem_total), b_width/2-9) + Fx::ub
+					+  Mv::l(b_width-3) + Mv::u(1+2*gpu.supported_functions.mem_utilization) + Theme::c("main_fg") + Fx::b + (gpu.mem_total_is_limit ? "Limit:" : "Total:") + rjust(floating_humanizer(gpu.mem_total), b_width/2-9) + Fx::ub
 					+  Mv::r(3) + rjust(to_string(safeVal(gpu.gpu_percent, "gpu-vram-totals"s).back()), 3) + '%';
 
 				//? Memory utilization
@@ -1189,7 +1208,7 @@ namespace Gpu {
 				out += Theme::c("main_fg") + Mv::r(1);
 				if (gpu.supported_functions.mem_total)
 					out += "VRAM total:" + rjust(floating_humanizer(gpu.mem_total), b_width/(1 + gpu.supported_functions.mem_clock)-14);
-				else out += "VRAM usage:" + rjust(floating_humanizer(gpu.mem_used), b_width/(1 + gpu.supported_functions.mem_clock)-14);
+				else out += string(gpu.mem_is_shared ? "Shmem used:" : "VRAM usage:") + rjust(floating_humanizer(gpu.mem_used), b_width/(1 + gpu.supported_functions.mem_clock)-14);
 
 				if (gpu.supported_functions.mem_clock)
 					out += "   VRAM clock:" + rjust(to_string(gpu.mem_clock_speed) + " MHz", b_width/2-13);
