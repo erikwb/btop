@@ -166,6 +166,9 @@ namespace Gpu {
 
 		long long mem_total = 0;
 		long long mem_used = 0;
+		bool gpu_utilization_valid = true; // Qualified telemetry can become stale.
+		bool mem_is_shared = false;
+		bool mem_total_is_limit = false;
 		deque<long long> mem_utilization_percent = {0}; // TODO: properly handle GPUs that can't report some stats
 		long long mem_clock_speed = 0; // MHz
 
