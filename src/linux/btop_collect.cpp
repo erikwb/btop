@@ -416,7 +416,7 @@ namespace Shared {
 		if (not Gpu::gpu_names.empty()) {
 			for (const auto& gpu : Gpu::gpus) {
 				for (const auto& [key, values] : gpu.gpu_percent)
-					if (not values.empty() and (key != "gpu-totals" or gpu.gpu_utilization_valid)
+					if (not values.empty() and (key != "gpu-totals" or gpu.supported_functions.gpu_utilization)
 						and not v_contains(Cpu::available_fields, key))
 						Cpu::available_fields.push_back(key);
 			}
@@ -2234,8 +2234,24 @@ namespace Gpu {
 			fs::path memory;
 			fs::path activity;
 			size_t index;
+			int invalid_ticks = 0;
 		};
 		vector<device_info> devices;
+
+		//? The driver reports "stale" for ~10 ms each time the GPU powers up from
+		//? a gate, until the first new firmware record. Re-read through that window.
+		static AsahiMemory::Activity read_activity(const fs::path& path) {
+			for (int attempt = 0;; ++attempt) {
+				ifstream input(path);
+				auto activity = AsahiMemory::parse_activity(input);
+				if (activity.percent or not activity.qualified or attempt == 4) return activity;
+				sleep_ms(5);
+			}
+		}
+
+		//? Ticks a qualified reading may be missing before the GPU reads as unavailable.
+		//? Shorter gaps repeat the last reading, as btop's graphs do between samples.
+		constexpr int hold_ticks = 2;
 
 		static void update(gpu_info& gpu, const AsahiMemory::Sample& sample) {
 			gpu.mem_used = sample.allocated;
@@ -2262,8 +2278,7 @@ namespace Gpu {
 				const auto sample = AsahiMemory::parse(input);
 				if (not sample) continue;
 
-				ifstream activity_input(device / "agx_stats");
-				const auto activity = AsahiMemory::parse_activity(activity_input);
+				const auto activity = read_activity(device / "agx_stats");
 				const auto index = gpus.size();
 				gpus.emplace_back();
 				gpu_names.resize(gpus.size());
@@ -2282,29 +2297,33 @@ namespace Gpu {
 				gpu.mem_is_shared = true;
 				gpu.mem_total_is_limit = true;
 				update(gpu, *sample);
-				devices.push_back({memory, device / "agx_stats", index});
+				devices.push_back({memory, device / "agx_stats", index, 0});
 				Logger::info("Apple GPU shared-memory accounting: {}; qualified activity: {}", memory.string(), activity.qualified);
 			}
 			return not devices.empty();
 		}
 
 		void collect() {
-			for (const auto& device : devices) {
+			for (auto& device : devices) {
 				ifstream input(device.memory);
 				auto& gpu = gpus[device.index];
 				if (const auto sample = AsahiMemory::parse(input)) update(gpu, *sample);
-				ifstream activity_input(device.activity);
-				const auto activity = AsahiMemory::parse_activity(activity_input);
+				const auto activity = read_activity(device.activity);
+				auto& totals = gpu.gpu_percent.at("gpu-totals");
+				if (activity.percent) {
+					device.invalid_ticks = 0;
+					totals.push_back(*activity.percent);
+				} else if (gpu.gpu_utilization_valid and ++device.invalid_ticks <= hold_ticks) {
+					totals.push_back(totals.back());
+					continue;
+				}
 				const bool valid = activity.percent.has_value();
 				if (valid != gpu.gpu_utilization_valid) {
-					// Clear old graphs on both stale->valid and valid->stale transitions.
-					gpu.gpu_percent.at("gpu-totals").clear();
-					gpu.gpu_percent.at("gpu-totals").push_back(0);
+					//? Graphs and meters are only laid out while valid; keep the history.
 					for (size_t i = 0; i < Gpu::redraw.size(); ++i) Gpu::redraw[i] = true;
 					Cpu::redraw = true;
 				}
 				gpu.gpu_utilization_valid = valid;
-				if (valid) gpu.gpu_percent.at("gpu-totals").push_back(*activity.percent);
 			}
 		}
 	}

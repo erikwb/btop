@@ -12,7 +12,11 @@ exporter. A zero ceiling means unlimited and is not plotted as a percentage.
 On kernels exposing qualified `agx_stats`, utilization is
 `util_device_percent`, accepted only when `utilisation_status` is `valid`.
 Missing, stale, malformed and out-of-range readings display as unavailable,
-not zero. Unqualified legacy counters are not interpreted. Clocks, power,
+not zero. The driver reports `stale` for about 10 ms whenever the GPU powers
+up from a gate, so a stale read is retried for up to 20 ms, and a reading
+still missing after that repeats the last value for up to two updates before
+the panel shows unavailable. The utilization history is kept across
+unavailable periods. Unqualified legacy counters are not interpreted. Clocks, power,
 temperature and bandwidth utilization remain unsupported.
 
 ## Build on framework
@@ -39,6 +43,11 @@ cmake --build build-arm -j 6
 - Live J716c test on `7.3.0-j716c-on1012g19+`: clean exit, real memory readings,
   49 valid utilization observations and transitions back to unavailable.
   Captured GPU panel showed 46% and 5.47 GiB allocated / 84.3 GiB limit.
+- 2026-11-11, on `7.3.0-ewb105+`: at a 200 ms update interval for 60 s,
+  with 5% of reads stale (runs of 11 ms or less), the previous build showed
+  "GPU load unavailable" 16 times and cleared the history each time. This
+  build showed it 0 times. Synthetic sysfs: a 120 ms stale blip drew nothing,
+  1 s of stale showed GPU N/A, and both layouts passed.
 - Evidence and UI harness are retained under `validation/` (not committed).
 
 Standalone parser test:
